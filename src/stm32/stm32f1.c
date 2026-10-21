@@ -1,4 +1,4 @@
-// Code to setup clocks and gpio on stm32f1
+// Code to setup clocks and gpio on stm32f1 and n32g45x
 //
 // Copyright (C) 2019-2022  Kevin O'Connor <kevin@koconnor.net>
 //
@@ -17,14 +17,56 @@
  * Clock setup
  ****************************************************************/
 
+// N32G45x specific register & peripheral extensions
+#define N32_PWR_CTRL3        (*(volatile uint32_t *)(PWR_BASE + 0x0c))
+#define N32_RCC_AHBRSTR      (*(volatile uint32_t *)(RCC_BASE + 0x28))
+#define N32_FLASH_ACR_ICAHEN (1U << 7)
+
+// N32G45x non-linear peripheral base addresses & RCC enable bits
+#define N32_SDIO_BASE        (AHBPERIPH_BASE + 0x0000) // 0x40018000
+#define N32_CRC_BASE         (AHBPERIPH_BASE + 0xB000) // 0x40023000
+#define N32_DVP_BASE         (APB2PERIPH_BASE + 0x6000) // 0x40016000
+#define N32_UART6_BASE       (APB2PERIPH_BASE + 0x5000) // 0x40015000
+#define N32_UART7_BASE       (APB2PERIPH_BASE + 0x5400) // 0x40015400
+#define N32_I2C3_BASE        (APB2PERIPH_BASE + 0x6400) // 0x40016400
+#define N32_I2C4_BASE        (APB2PERIPH_BASE + 0x6800) // 0x40016800
+
+#define N32_AHBENR_SDIOEN    (1U << 10)
+#define N32_AHBENR_CRCEN     (1U << 6)
+#define N32_APB2ENR_DVPEN    (1U << 16)
+#define N32_APB2ENR_UART6EN  (1U << 17)
+#define N32_APB2ENR_UART7EN  (1U << 18)
+#define N32_APB2ENR_I2C3EN   (1U << 19)
+#define N32_APB2ENR_I2C4EN   (1U << 20)
+
 // Map a peripheral address to its enable bits
 struct cline
 lookup_clock_line(uint32_t periph_base)
 {
     if (periph_base >= AHBPERIPH_BASE) {
+        if (CONFIG_MACH_N32G45x) {
+            if (periph_base == N32_SDIO_BASE)
+                return (struct cline){.en=&RCC->AHBENR, .bit=N32_AHBENR_SDIOEN};
+            if (periph_base == N32_CRC_BASE)
+                return (struct cline){.en=&RCC->AHBENR, .bit=N32_AHBENR_CRCEN};
+            uint32_t bit = 1 << ((periph_base - AHBPERIPH_BASE) / 0x400);
+            return (struct cline){.en=&RCC->AHBENR, .rst=&N32_RCC_AHBRSTR, .bit=bit};
+        }
         uint32_t bit = 1 << ((periph_base - AHBPERIPH_BASE) / 0x400);
         return (struct cline){.en=&RCC->AHBENR, .bit=bit};
     } else if (periph_base >= APB2PERIPH_BASE) {
+        if (CONFIG_MACH_N32G45x) {
+            if (periph_base == N32_DVP_BASE)
+                return (struct cline){.en=&RCC->APB2ENR, .rst=&RCC->APB2RSTR, .bit=N32_APB2ENR_DVPEN};
+            if (periph_base == N32_UART6_BASE)
+                return (struct cline){.en=&RCC->APB2ENR, .rst=&RCC->APB2RSTR, .bit=N32_APB2ENR_UART6EN};
+            if (periph_base == N32_UART7_BASE)
+                return (struct cline){.en=&RCC->APB2ENR, .rst=&RCC->APB2RSTR, .bit=N32_APB2ENR_UART7EN};
+            if (periph_base == N32_I2C3_BASE)
+                return (struct cline){.en=&RCC->APB2ENR, .rst=&RCC->APB2RSTR, .bit=N32_APB2ENR_I2C3EN};
+            if (periph_base == N32_I2C4_BASE)
+                return (struct cline){.en=&RCC->APB2ENR, .rst=&RCC->APB2RSTR, .bit=N32_APB2ENR_I2C4EN};
+        }
         uint32_t bit = 1 << ((periph_base - APB2PERIPH_BASE) / 0x400);
         return (struct cline){.en=&RCC->APB2ENR, .rst=&RCC->APB2RSTR, .bit=bit};
     } else {
@@ -38,8 +80,13 @@ uint32_t
 get_pclock_frequency(uint32_t periph_base)
 {
     if (CONFIG_MACH_N32G45x) {
-        // Both APB busses run at the same rate, using PCLK1's tighter
-        // 36Mhz limit to choose the divisor
+        if (periph_base >= APB2PERIPH_BASE) {
+            // APB2 (PCLK2) is rated up to 72MHz max on N32G45x
+            if (CONFIG_CLOCK_FREQ > 72000000)
+                return CONFIG_CLOCK_FREQ / 2;
+            return CONFIG_CLOCK_FREQ;
+        }
+        // APB1 (PCLK1) is rated up to 36MHz max on N32G45x
         if (CONFIG_CLOCK_FREQ > 72000000)
             return CONFIG_CLOCK_FREQ / 4;
         if (CONFIG_CLOCK_FREQ > 36000000)
@@ -55,12 +102,12 @@ gpio_clock_enable(GPIO_TypeDef *regs)
 {
     uint32_t rcc_pos = ((uint32_t)regs - APB2PERIPH_BASE) / 0x400;
     RCC->APB2ENR |= 1 << rcc_pos;
-    RCC->APB2ENR;
+    (void)RCC->APB2ENR;
 }
 
 // PLL (f103) input: 1 to 25Mhz, output: 16 to 72Mhz
 
-// Main clock setup called at chip startup
+// Main clock setup called at chip startup for standard STM32F103
 static void
 clock_setup(void)
 {
@@ -69,6 +116,8 @@ clock_setup(void)
     if (!CONFIG_STM32_CLOCK_REF_INTERNAL) {
         // Configure 72Mhz PLL from external crystal (HSE)
         RCC->CR |= RCC_CR_HSEON;
+        while (!(RCC->CR & RCC_CR_HSERDY))
+            ;
         uint32_t div = CONFIG_CLOCK_FREQ / (CONFIG_CLOCK_REF_FREQ / 2);
         cfgr = 1 << RCC_CFGR_PLLSRC_Pos;
         if ((div & 1) && div <= 16)
@@ -99,10 +148,6 @@ clock_setup(void)
         ;
 }
 
-// The stm32f103 PWR block has just two registers; the n32g45x adds a
-// third one holding the "ex mode" enable bit
-#define N32_PWR_CTRL3 (*(volatile uint32_t *)(PWR_BASE + 0x0c))
-
 // Return the RCC_CFGR bits that select the given PLL multiplier on the
 // n32g45x, whose PLLMUL field is five bits wide (PLLMUL[4] is bit 27)
 static uint32_t
@@ -110,7 +155,7 @@ n32g45x_pll_multiplier_bits(uint32_t mul)
 {
     if (mul > 16)
         // Multipliers above 16 are encoded with PLLMUL[4] (bit 27) set
-        return ((mul - 17) << RCC_CFGR_PLLMULL_Pos) | (1 << 27);
+        return ((mul - 17) << RCC_CFGR_PLLMULL_Pos) | (1U << 27);
     return (mul - 2) << RCC_CFGR_PLLMULL_Pos;
 }
 
@@ -119,30 +164,45 @@ n32g45x_pll_multiplier_bits(uint32_t mul)
       && (2 * CONFIG_CLOCK_FREQ) % CONFIG_CLOCK_REF_FREQ
     #error "Unable to generate the requested clock rate from this crystal"
   #endif
-  #if CONFIG_USB && CONFIG_CLOCK_FREQ != 144000000
+  #if CONFIG_USB && CONFIG_CLOCK_FREQ != 144000000 \
+      && CONFIG_CLOCK_FREQ != 96000000 \
+      && CONFIG_CLOCK_FREQ != 72000000 \
+      && CONFIG_CLOCK_FREQ != 48000000
     #error "Unable to generate a 48Mhz usb clock at this system clock rate"
   #endif
 #endif
 
 // The n32g45x is register compatible with the stm32f103, but has its
-// own clock tree: PCLK2 is limited to 72Mhz and PCLK1 to 36Mhz, and
-// flash wait states scale with HCLK in 32Mhz steps
+// own clock tree: PCLK2 is limited to 72Mhz and PCLK1 to 36Mhz,
+// flash wait states scale with HCLK in 32Mhz steps, and Flash has an
+// instruction cache (ICAHEN, bit 7)
 static void
 clock_setup_n32g45x(void)
 {
     // The n32g45x keeps its adc, sdio, qspi, opamp, comp and can2 behind
     // the "ex mode" bit: while it is clear their RCC enable bits read back
-    // as zero and the peripherals stay unclocked.  The vendor SystemInit()
-    // sets it before configuring any clock, so do the same here.
+    // as zero and the peripherals stay unclocked.
     RCC->APB1ENR |= RCC_APB1ENR_PWREN;
     N32_PWR_CTRL3 |= 1;
     RCC->APB1ENR &= ~RCC_APB1ENR_PWREN;
 
-    // Configure and enable PLL
+    // Ensure HSI is enabled (required for Flash operations and ADC1M fallback)
+    // and switch system clock to HSI before disabling and reconfiguring PLL.
+    RCC->CR |= RCC_CR_HSION;
+    while (!(RCC->CR & RCC_CR_HSIRDY))
+        ;
+    RCC->CFGR &= ~RCC_CFGR_SW_Msk;
+    while ((RCC->CFGR & RCC_CFGR_SWS_Msk) != RCC_CFGR_SWS_HSI)
+        ;
+    RCC->CR &= ~RCC_CR_PLLON;
+
+    // Configure PLL
     uint32_t cfgr;
     if (!CONFIG_STM32_CLOCK_REF_INTERNAL) {
-        // Configure PLL from external crystal (HSE)
+        // Configure PLL from external crystal (HSE) and wait for stabilization
         RCC->CR |= RCC_CR_HSEON;
+        while (!(RCC->CR & RCC_CR_HSERDY))
+            ;
         uint32_t div = CONFIG_CLOCK_FREQ / (CONFIG_CLOCK_REF_FREQ / 2);
         cfgr = 1 << RCC_CFGR_PLLSRC_Pos;
         if ((div & 1) && div <= 32)
@@ -151,29 +211,41 @@ clock_setup_n32g45x(void)
             div /= 2;
         cfgr |= n32g45x_pll_multiplier_bits(div);
     } else {
-        // Configure PLL from internal 8Mhz oscillator (HSI)
+        // Configure PLL from internal 8Mhz oscillator (HSI / 2 = 4Mhz)
         uint32_t div2 = (CONFIG_CLOCK_FREQ / 8000000) * 2;
         cfgr = (0 << RCC_CFGR_PLLSRC_Pos) | n32g45x_pll_multiplier_bits(div2);
     }
-    // Divide both APB busses by the same amount, using PCLK1's tighter
-    // 36Mhz limit to choose the divisor (RCC_CFGR bits 15:14 are
-    // reserved on the n32g45x - the adc clock is configured separately
-    // in n32g45x_adc.c via RCC_CFG2)
+
+    // Independently scale APB2 (72Mhz max) and APB1 (36Mhz max)
+    // (RCC_CFGR bits 15:14 are reserved on the n32g45x - the adc clock is
+    // configured separately in n32g45x_adc.c via RCC_CFG2)
     if (CONFIG_CLOCK_FREQ > 72000000)
-        cfgr |= RCC_CFGR_PPRE1_DIV4 | RCC_CFGR_PPRE2_DIV4;
+        cfgr |= RCC_CFGR_PPRE1_DIV4 | RCC_CFGR_PPRE2_DIV2;
     else if (CONFIG_CLOCK_FREQ > 36000000)
-        cfgr |= RCC_CFGR_PPRE1_DIV2 | RCC_CFGR_PPRE2_DIV2;
-    // The n32g45x usb clock is PLLCLK divided by 1.5, 1, 2 or 3 - at
-    // 144Mhz the /3 divisor produces the 48Mhz the usb peripheral needs
-    if (CONFIG_CLOCK_FREQ == 144000000)
-        cfgr |= 3 << 22;
-    RCC->CFGR = cfgr;
-    RCC->CR |= RCC_CR_PLLON;
+        cfgr |= RCC_CFGR_PPRE1_DIV2 | RCC_CFGR_PPRE2_DIV1;
+    else
+        cfgr |= RCC_CFGR_PPRE1_DIV1 | RCC_CFGR_PPRE2_DIV1;
+
+    // Configure 48Mhz USB clock prescaler (bits 23:22: 0=/1.5, 1=/1, 2=/2, 3=/3)
+    if (CONFIG_USB) {
+        if (CONFIG_CLOCK_FREQ == 144000000)
+            cfgr |= 3U << 22;
+        else if (CONFIG_CLOCK_FREQ == 96000000)
+            cfgr |= 2U << 22;
+        else if (CONFIG_CLOCK_FREQ == 72000000)
+            cfgr |= 0U << 22;
+        else if (CONFIG_CLOCK_FREQ == 48000000)
+            cfgr |= 1U << 22;
+    }
 
     // Set flash latency (0: <=32Mhz, 1: <=64Mhz, 2: <=96Mhz, 3: <=128Mhz,
-    // 4: <=144Mhz)
+    // 4: <=144Mhz) + Prefetch + N32G45x Instruction Cache (ICAHEN)
     uint32_t latency = (CONFIG_CLOCK_FREQ - 1) / 32000000;
-    FLASH->ACR = (latency << FLASH_ACR_LATENCY_Pos) | FLASH_ACR_PRFTBE;
+    FLASH->ACR = (latency << FLASH_ACR_LATENCY_Pos)
+                 | FLASH_ACR_PRFTBE | N32_FLASH_ACR_ICAHEN;
+
+    RCC->CFGR = cfgr;
+    RCC->CR |= RCC_CR_PLLON;
 
     // Wait for PLL lock
     while (!(RCC->CR & RCC_CR_PLLRDY))
@@ -311,6 +383,23 @@ gpio_peripheral(uint32_t gpio, uint32_t mode, int pullup)
  * Bootloader
  ****************************************************************/
 
+// Katapult REQUEST_CANBOOT magic signature (0x5984E3FA6CA1589B)
+#define KATAPULT_REQUEST_BOOT 0x5984E3FA6CA1589BULL
+
+// Write a 64-bit boot signature into Backup Domain registers DR1..DR4
+// (Device memory on N32G45x, immune to Cortex-M SRAM write-buffering loss)
+static void
+bkp_write_boot_code(uint64_t sig)
+{
+    RCC->APB1ENR |= RCC_APB1ENR_PWREN | RCC_APB1ENR_BKPEN;
+    PWR->CR |= PWR_CR_DBP;
+    BKP->DR1 = (uint16_t)(sig & 0xFFFF);
+    BKP->DR2 = (uint16_t)((sig >> 16) & 0xFFFF);
+    BKP->DR3 = (uint16_t)((sig >> 32) & 0xFFFF);
+    BKP->DR4 = (uint16_t)((sig >> 48) & 0xFFFF);
+    PWR->CR &= ~PWR_CR_DBP;
+}
+
 // Reboot into USB "HID" bootloader
 static void
 usb_hid_bootloader(void)
@@ -339,7 +428,19 @@ usb_stm32duino_bootloader(void)
 void
 bootloader_request(void)
 {
+    if (CONFIG_MACH_N32G45x) {
+        // Store REQUEST_CANBOOT in BKP->DR1..DR4 (BKP->DAT1..DAT4) before
+        // calling try_request_canboot() so it survives NVIC_SystemReset()
+        // even if the SRAM write in try_request_canboot() is still buffered.
+        bkp_write_boot_code(KATAPULT_REQUEST_BOOT);
+        __DSB();
+    }
     try_request_canboot();
+    if (CONFIG_MACH_N32G45x) {
+        // If try_request_canboot() returned, Katapult is not installed;
+        // clear BKP->DR1..DR4 before falling through to other bootloaders.
+        bkp_write_boot_code(0);
+    }
     if (CONFIG_STM32_FLASH_START_800)
         usb_hid_bootloader();
     else if (CONFIG_STM32_FLASH_START_2000)
